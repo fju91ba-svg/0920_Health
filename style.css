@@ -368,6 +368,40 @@ dialog.sheet::backdrop { background: rgba(20, 30, 25, .55); }
 .chipbtn[aria-pressed="true"] { background: var(--primary); color: #fff; }
 details summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 700; }
 
+/* ---------- account bar ---------- */
+.acctbar {
+  max-width: 900px; margin: 0 auto; padding: 0 16px 10px;
+  display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap;
+  text-align: center; font-size: .85rem;
+}
+.acct-msg { line-height: 1.4; }
+.acct-btn {
+  min-height: 44px; padding: 2px 16px;
+  border: 2px solid #fff; border-radius: 999px;
+  background: #fff; color: var(--primary); font-weight: 800;
+}
+.sync.error { color: #ffd9a8; font-weight: 800; }
+
+/* ---------- health vitals ---------- */
+.vitals { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 10px; }
+.vital { display: grid; gap: 4px; font-weight: 700; }
+.vital em { font-style: normal; font-weight: 400; color: var(--ink-soft); font-size: .8rem; }
+.vital input {
+  min-height: 52px; width: 100%; padding: 4px 12px;
+  border: 2px solid var(--line); border-radius: 12px; background: #fff; font-weight: 600;
+}
+.vhint { color: #a22d22; font-weight: 700; min-height: 0; }
+.login-row {
+  display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+  padding: 8px 0; border-bottom: 1px solid var(--line);
+}
+.login-row small { color: var(--ink-soft); word-break: break-all; }
+.login-row .when { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.alert .btns { display: inline-flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: center; }
+#auth .form { margin-top: 12px; padding-top: 0; border-top: 0; }
+#auth .form-grid { grid-template-columns: 1fr; }
+.field input[type="text"] { min-height: 52px; }
+
 /* ---------- invite dialog ---------- */
 #invite .form { margin-top: 12px; padding-top: 0; border-top: 0; }
 #invite .form-grid { grid-template-columns: 1fr; }
@@ -432,7 +466,7 @@ details summary { min-height: 44px; display: flex; align-items: center; cursor: 
 }
 
 @media print {
-  .hero, .topbar, .admin-btn, .tabbar, .foot, .datebar, .datebar-extra, .btn, #toast, .alerts, .dose-btn { display: none !important; }
+  .hero, .topbar, .acctbar, .admin-btn, .tabbar, .foot, .datebar, .datebar-extra, .btn, #toast, .alerts, .dose-btn { display: none !important; }
   body { background: #fff; }
   .card { box-shadow: none; break-inside: avoid; }
 }

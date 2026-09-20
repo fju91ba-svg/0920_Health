@@ -137,12 +137,26 @@
 
   /* ---------- 資料存取 ---------- */
 
-  const STORE = 'silver-diet-v1';
+  // 訪客（未登入）與每位會員各自使用一個本機儲存位置，共用同一台裝置也不會看到別人的資料
+  const GUEST_KEY = 'silver-diet-v1';
+  const userKey = id => `silver-diet-v1:${id}`;
+  let storeKey = GUEST_KEY;
+
+  // 每日健康數值（血壓、心跳、血糖、體重、睡眠）：只接受合理範圍內的數字
+  const VITALS = {
+    sys:     { label: '收縮壓（高壓）', unit: 'mmHg',  min: 50,  max: 300, step: 1 },
+    dia:     { label: '舒張壓（低壓）', unit: 'mmHg',  min: 30,  max: 200, step: 1 },
+    pulse:   { label: '心跳',           unit: '次/分', min: 30,  max: 220, step: 1 },
+    glucose: { label: '血糖',           unit: 'mg/dL', min: 20,  max: 700, step: 1 },
+    weight:  { label: '體重',           unit: '公斤',  min: 20,  max: 250, step: 0.1 },
+    sleep:   { label: '昨晚睡眠',       unit: '小時',  min: 0,   max: 24,  step: 0.5 },
+  };
 
   const emptyMeal = () => ({ time: '', amount: '', items: [] });
   const emptyDay = () => ({
     meals: Object.fromEntries(MEALS.map(m => [m.key, emptyMeal()])),
-    water: 0, mood: '', note: '',
+    water: 0, mood: '', note: '', vitals: {},
+    ts: 0, // 最後修改時間（毫秒），雲端同步時用來判斷誰比較新
   });
 
   const normalizeDay = raw => {
@@ -163,7 +177,20 @@
     d.water = Math.max(0, Math.min(20, Number(raw.water) || 0));
     d.mood = MOODS.some(m => m.v === raw.mood) ? raw.mood : '';
     d.note = typeof raw.note === 'string' ? raw.note.slice(0, 1000) : '';
+    for (const [k, v] of Object.entries(VITALS)) {
+      const raw_v = raw.vitals && raw.vitals[k];
+      const n = Number(raw_v);
+      if (raw_v !== '' && raw_v != null && Number.isFinite(n) && n >= v.min && n <= v.max) d.vitals[k] = n;
+    }
+    d.ts = Number(raw.ts) > 0 ? Number(raw.ts) : 0;
     return d;
+  };
+
+  // 服藥紀錄：{ '藥物id@時間': '08:12' }
+  const cleanTaken = log => {
+    const out = {};
+    if (log && typeof log === 'object') for (const [k, v] of Object.entries(log)) if (typeof v === 'string') out[k.slice(0, 60)] = v.slice(0, 10);
+    return out;
   };
 
   const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
@@ -218,18 +245,23 @@
       notify: !!raw.notify,
       invites: (Array.isArray(raw.invites) ? raw.invites : []).map(normalizeInvite).filter(Boolean),
       siteUrl: typeof raw.siteUrl === 'string' && /^https?:\/\/\S+$/.test(raw.siteUrl.trim()) ? raw.siteUrl.trim().slice(0, 300) : '',
+      settingsTs: Number(raw.settingsTs) > 0 ? Number(raw.settingsTs) : 0, // 用藥/看診設定的最後同步時間
+      settingsSynced: typeof raw.settingsSynced === 'string' ? raw.settingsSynced.slice(0, 60000) : '', // 雲端最後確認收到的設定版本
     };
   };
 
-  const load = () => {
+  const readDb = key => {
     try {
-      const raw = JSON.parse(localStorage.getItem(STORE) || 'null');
+      const raw = JSON.parse(localStorage.getItem(key) || 'null');
       if (raw && typeof raw.days === 'object') return normalizeDb(raw);
     } catch (_) { /* 讀取失敗就從空白開始 */ }
     return normalizeDb({});
   };
+  const writeDb = (key, data) => {
+    try { localStorage.setItem(key, JSON.stringify(data)); return true; } catch (_) { return false; }
+  };
 
-  let db = load();
+  let db = readDb(GUEST_KEY);
   const newAppt = () => ({ id: null, date: '', time: '', place: '', dept: '', doctor: '', note: '' });
   const newMed = () => ({ id: null, name: '', dose: '', note: '', times: [] });
   const state = {
@@ -238,10 +270,13 @@
     welcome: null, // 受邀者從信件連結進來時顯示的歡迎訊息
   };
 
-  const save = () => {
-    try { localStorage.setItem(STORE, JSON.stringify(db)); }
-    catch (_) { toast('⚠️ 無法儲存，瀏覽器可能封鎖了儲存空間'); }
+  const dirtyDays = new Set(); // 已修改、還沒上傳到雲端的日期
+
+  const saveLocal = () => {
+    if (!writeDb(storeKey, db)) toast('⚠️ 無法儲存，瀏覽器可能封鎖了儲存空間');
   };
+  // 存到本機，並（已登入時）排程同步到雲端
+  const save = () => { saveLocal(); syncSoon(); };
 
   const getDay = date => db.days[date] || emptyDay();
 
@@ -249,6 +284,8 @@
   const edit = (fn, rerender = true) => {
     const d = db.days[state.date] || (db.days[state.date] = emptyDay());
     fn(d);
+    d.ts = Date.now();
+    dirtyDays.add(state.date);
     save();
     if (rerender) render();
   };
@@ -284,6 +321,9 @@
     } else {
       log[key] = date === todayStr() ? nowHM() : '補記';
     }
+    const d = db.days[date] || (db.days[date] = emptyDay());
+    d.ts = Date.now();
+    dirtyDays.add(date);
     save();
     render();
   };
@@ -398,14 +438,38 @@
       day.water >= 6 ? ' 👍 水分足夠！' : ''),
     h('p', { class: 'hint' }, '每杯約 250 毫升；點第幾杯就代表喝到第幾杯，再點一次可取消。'));
 
+  const vitalField = (k, day) => {
+    const v = VITALS[k];
+    const hint = h('small', { class: 'vhint', role: 'status' });
+    return h('label', { class: 'vital' },
+      h('span', {}, v.label, h('em', {}, ` ${v.unit}`)),
+      h('input', {
+        type: 'number', inputmode: 'decimal', min: v.min, max: v.max, step: v.step,
+        value: day.vitals[k] != null ? day.vitals[k] : '', placeholder: '—',
+        oninput: e => {
+          const raw = e.target.value;
+          if (raw === '') { hint.textContent = ''; edit(d => { delete d.vitals[k]; }, false); return; }
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n < v.min || n > v.max) { hint.textContent = `請輸入 ${v.min}～${v.max}`; return; }
+          hint.textContent = '';
+          edit(d => { d.vitals[k] = n; }, false);
+        },
+      }),
+      hint);
+  };
+
   const feelCard = day => h('section', { class: 'card', 'aria-labelledby': 'feel-h' },
-    h('h2', { id: 'feel-h' }, '🌿 今天的身體感覺'),
+    h('h2', { id: 'feel-h' }, '🌿 今日健康狀態'),
+    h('p', { class: 'hint', style: 'margin:0 0 8px' }, '精神狀況'),
     h('div', { class: 'seg' }, MOODS.map(m => h('button', {
       type: 'button', 'aria-pressed': String(day.mood === m.v),
       onclick: () => edit(d => { d.mood = d.mood === m.v ? '' : m.v; }),
     }, `${m.emoji} ${m.label}`))),
+    h('p', { class: 'hint', style: 'margin:14px 0 8px' }, '今天量了什麼？有量再填就好（自動儲存）'),
+    h('div', { class: 'vitals' }, Object.keys(VITALS).map(k => vitalField(k, day))),
+    h('p', { class: 'hint' }, '數值只是記錄，看診時給醫師參考；覺得不舒服或數值異常，請洽醫師。'),
     h('textarea', {
-      placeholder: '想記下什麼都可以，例如：血糖、血壓、胃口、排便、看診提醒…',
+      placeholder: '想記下什麼都可以，例如：胃口、排便、哪裡不舒服…',
       'aria-label': '今日備註', maxlength: 1000,
       oninput: e => edit(d => { d.note = e.target.value; }, false),
     }, day.note));
@@ -509,6 +573,9 @@
           h('span', { class: 'detail' },
             h('span', {}, '三餐 ', h('span', { class: 'dots', 'aria-label': `${mealsLogged(day)} 餐有記錄` }, dots)),
             h('span', {}, `💧 ${day.water} 杯`),
+            day.vitals.sys && day.vitals.dia && h('span', {}, `🩺 血壓 ${day.vitals.sys}/${day.vitals.dia}`),
+            day.vitals.glucose && h('span', {}, `🩸 血糖 ${day.vitals.glucose}`),
+            day.vitals.weight && h('span', {}, `⚖️ ${day.vitals.weight} 公斤`),
             (() => { const s = doseStats(date); return s.total > 0 && h('span', {}, `💊 ${s.taken}/${s.total} 次`); })(),
             h('span', {}, `✅ ${catsMet(day)}/${GOAL_KEYS.length} 類達標`)));
       })),
@@ -695,7 +762,9 @@
           : '目前無法確認邀請（網路連線問題），網站仍可正常使用。';
       items.push(h('div', { class: 'alert welcome', role: 'status' },
         h('span', {}, msg),
-        h('button', { class: 'btn primary', type: 'button', onclick: () => { state.welcome = null; renderAlerts(); } }, '開始使用')));
+        h('span', { class: 'btns' },
+          w.kind === 'ok' && sb && !cloud.user && h('button', { class: 'btn primary', type: 'button', onclick: () => { state.welcome = null; renderAlerts(); openAuth('register', w.name); } }, '註冊帳號'),
+          h('button', { class: `btn${w.kind === 'ok' && sb && !cloud.user ? '' : ' primary'}`, type: 'button', onclick: () => { state.welcome = null; renderAlerts(); } }, '開始使用'))));
     }
     const due = dosesFor(today).filter(d => d.time <= hm && !takenAt(today, d.key));
     due.slice(0, 3).forEach(d => items.push(h('div', { class: 'alert med', role: 'alert' },
@@ -875,6 +944,309 @@
     ];
   };
 
+  /* ---------- 會員登入與雲端同步（Supabase Auth + daily_logs）---------- */
+  // 本機優先：所有修改先存在本機，已登入時在背景上傳。
+  // 雲端資料表都有 RLS，每個人只能讀寫自己的資料。
+
+  const sb = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+  const cloud = { user: null, status: 'off' }; // status: off | syncing | ok | error
+  let flushing = false, flushTimer;
+
+  const EMPTY_SETTINGS = JSON.stringify({ meds: [], appts: [] });
+  const settingsJson = () => JSON.stringify({ meds: db.meds, appts: db.appts });
+  // 「用藥＋看診」有尚未上傳的修改嗎？（db.settingsSynced＝雲端最後確認收到的版本）
+  const settingsPending = () => {
+    const j = settingsJson(), s = db.settingsSynced || '';
+    return j !== s && !(s === '' && j === EMPTY_SETTINGS);
+  };
+  const isTyping = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement ? document.activeElement.tagName : '');
+  const memberName = () => {
+    const u = cloud.user;
+    return u ? ((u.user_metadata && u.user_metadata.name) || u.email || '會員') : '';
+  };
+
+  const setStatus = s => { cloud.status = s; renderAcct(); };
+
+  const syncSoon = (delay = 1200) => {
+    if (!sb || !cloud.user) return;
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(flush, delay);
+  };
+
+  const dayPayload = date => {
+    const { ts, ...rest } = db.days[date]; // eslint-disable-line no-unused-vars
+    return { ...rest, taken: db.medLog[date] || {} };
+  };
+
+  const flush = async () => {
+    if (!sb || !cloud.user) return;
+    if (flushing) { syncSoon(500); return; }
+    flushing = true;
+    setStatus('syncing');
+    const uidNow = cloud.user.id;
+    try {
+      for (const date of [...dirtyDays]) {
+        const day = db.days[date];
+        if (!day) { dirtyDays.delete(date); continue; }
+        if (!day.ts) day.ts = Date.now();
+        const sentTs = day.ts;
+        const { error } = await sb.from('daily_logs').upsert(
+          { user_id: uidNow, log_date: date, data: dayPayload(date), updated_at: new Date(sentTs).toISOString() },
+          { onConflict: 'user_id,log_date' });
+        if (error) throw error;
+        if (db.days[date] && db.days[date].ts === sentTs) dirtyDays.delete(date); // 上傳途中又改過就保留
+      }
+      if (settingsPending()) {
+        const json = settingsJson();
+        const ts = Date.now();
+        const { error } = await sb.from('user_settings').upsert(
+          { user_id: uidNow, data: { meds: db.meds, appts: db.appts }, updated_at: new Date(ts).toISOString() },
+          { onConflict: 'user_id' });
+        if (error) throw error;
+        db.settingsTs = ts;
+        db.settingsSynced = json;
+        saveLocal();
+      }
+      flushing = false;
+      setStatus('ok');
+      if (dirtyDays.size || settingsPending()) syncSoon();
+    } catch (_) {
+      flushing = false;
+      setStatus('error');
+      syncSoon(30000); // 網路不通時 30 秒後再試
+    }
+  };
+
+  // 從雲端取回資料，與本機合併（以「最後修改時間」較新的為準）
+  const pullAll = async () => {
+    if (!sb || !cloud.user) return;
+    setStatus('syncing');
+    let changed = false;
+    try {
+      const { data: rows, error } = await sb.from('daily_logs')
+        .select('log_date,data,updated_at').order('log_date', { ascending: false }).limit(1000);
+      if (error) throw error;
+      const seen = new Set();
+      for (const r of rows) {
+        seen.add(r.log_date);
+        const cloudTs = Date.parse(r.updated_at);
+        const local = db.days[r.log_date];
+        if (!local || cloudTs > (local.ts || 0)) {
+          const day = normalizeDay(r.data);
+          day.ts = cloudTs;
+          db.days[r.log_date] = day;
+          const taken = cleanTaken(r.data && r.data.taken);
+          if (Object.keys(taken).length) db.medLog[r.log_date] = taken; else delete db.medLog[r.log_date];
+          changed = true;
+        } else if ((local.ts || 0) > cloudTs) {
+          dirtyDays.add(r.log_date);
+        }
+      }
+      for (const date of Object.keys(db.days)) if (!seen.has(date)) dirtyDays.add(date); // 雲端還沒有的日子
+
+      const { data: s, error: e2 } = await sb.from('user_settings').select('data,updated_at').maybeSingle();
+      if (e2) throw e2;
+      // 本機沒有未上傳的修改時，才用雲端版本覆蓋；有的話以本機為準，稍後上傳
+      if (s && !settingsPending()) {
+        const before = settingsJson();
+        db.meds = (Array.isArray(s.data && s.data.meds) ? s.data.meds : []).map(normalizeMed).filter(Boolean);
+        db.appts = (Array.isArray(s.data && s.data.appts) ? s.data.appts : []).map(normalizeAppt).filter(Boolean);
+        db.settingsTs = Date.parse(s.updated_at);
+        db.settingsSynced = settingsJson();
+        if (before !== db.settingsSynced) changed = true;
+      }
+      saveLocal();
+      setStatus('ok');
+      if (changed && !isTyping()) render();
+      syncSoon(300);
+    } catch (_) {
+      setStatus('error');
+      syncSoon(30000);
+    }
+  };
+
+  const hasData = x => Object.keys(x.days).length > 0 || x.meds.length > 0 || x.appts.length > 0;
+  const mergeInto = (target, src) => {
+    for (const [date, day] of Object.entries(src.days)) {
+      const t = target.days[date];
+      if (!t || (day.ts || 0) > (t.ts || 0)) {
+        target.days[date] = day;
+        if (src.medLog[date]) target.medLog[date] = src.medLog[date];
+      }
+    }
+    for (const m of src.meds) if (!target.meds.some(x => x.id === m.id)) target.meds.push(m);
+    for (const a of src.appts) if (!target.appts.some(x => x.id === a.id)) target.appts.push(a);
+    for (const i of src.invites) if (!target.invites.some(x => x.email === i.email)) target.invites.push(i);
+  };
+
+  // 登入／登出時切換資料：登入用該會員自己的本機資料，登出回到訪客資料
+  let adoptedUid = null;
+  const adoptSession = async session => {
+    const user = session ? session.user : null;
+    const id = user ? user.id : null;
+    if (id === adoptedUid) { cloud.user = user; renderAcct(); return; }
+    adoptedUid = id;
+    cloud.user = user;
+    clearTimeout(flushTimer);
+    dirtyDays.clear();
+    const fontSize = db.fontSize;
+
+    if (user) {
+      const guest = readDb(GUEST_KEY);
+      storeKey = userKey(id);
+      db = readDb(storeKey);
+      db.fontSize = fontSize;
+      if (hasData(guest)) {
+        const n = Object.keys(guest.days).length;
+        if (confirm(`這台裝置上已有訪客記錄（${n} 天）。\n要合併到「${memberName()}」的帳號嗎？\n\n按「取消」則不合併，這些記錄會繼續留在訪客資料裡。`)) {
+          mergeInto(db, guest);
+          writeDb(GUEST_KEY, { ...normalizeDb({}), fontSize });
+        }
+      }
+      saveLocal();
+    } else {
+      storeKey = GUEST_KEY;
+      db = readDb(GUEST_KEY);
+      db.fontSize = fontSize;
+    }
+    state.date = todayStr();
+    render();
+    renderAcct();
+    if (user) await pullAll();
+  };
+
+  const flushNow = async () => {
+    clearTimeout(flushTimer);
+    for (let i = 0; i < 40 && flushing; i++) await new Promise(r => setTimeout(r, 250));
+    await flush();
+  };
+
+  const logout = async () => {
+    if (!sb) return;
+    await flushNow();
+    const synced = cloud.status === 'ok' && !dirtyDays.size && !settingsPending();
+    const key = storeKey;
+    if (!synced && !confirm('還有記錄尚未同步到雲端（可能是網路不通）。現在登出，這些記錄會留在這台裝置，下次登入時會再同步。\n\n確定要登出嗎？')) return;
+    await sb.auth.signOut();
+    // 已完全同步就清掉這台裝置上的個人副本，共用電腦更安心
+    if (synced) { try { localStorage.removeItem(key); } catch (_) { /* ignore */ } }
+    toast('已登出');
+  };
+
+  if (sb) {
+    // 注意：回呼裡不能直接呼叫其他 supabase 方法，所以用 setTimeout 跳出去
+    sb.auth.onAuthStateChange((_evt, session) => { setTimeout(() => adoptSession(session), 0); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && cloud.user) pullAll(); });
+    window.addEventListener('online', () => { if (cloud.user) syncSoon(300); });
+  }
+
+  /* ---- 帳號列（頁首下方）---- */
+
+  const renderAcct = () => {
+    const bar = $('#acctbar');
+    if (!bar) return;
+    if (!sb) {
+      bar.replaceChildren(h('span', { class: 'acct-msg' }, '☁️ 雲端功能暫時無法使用（需要連上網路）。記錄仍會存在這台裝置。'));
+      return;
+    }
+    if (!cloud.user) {
+      bar.replaceChildren(
+        h('span', { class: 'acct-msg' }, '☁️ 尚未登入：記錄只存在這台裝置。登入後會存到雲端，換手機也能看。'),
+        h('button', { class: 'acct-btn', type: 'button', onclick: () => openAuth('login') }, '登入／註冊'));
+      return;
+    }
+    const st = { syncing: '🔄 同步中…', ok: '✅ 已同步到雲端', error: '⚠️ 同步失敗，稍後會自動重試', off: '' }[cloud.status];
+    bar.replaceChildren(
+      h('span', { class: 'acct-msg' }, h('b', {}, `👤 ${memberName()}`), h('span', { class: `sync ${cloud.status}` }, `　${st}`)),
+      h('button', { class: 'acct-btn', type: 'button', onclick: logout }, '登出'));
+  };
+
+  /* ---- 登入／註冊視窗 ---- */
+
+  const authDlg = $('#auth');
+  const au = { mode: 'login', busy: false, err: '', info: '', draft: { name: '', email: '', pw: '' } };
+
+  const authErrText = e => {
+    const m = String((e && e.message) || e || '');
+    if (/invalid login credentials/i.test(m)) return '電子郵件或密碼錯誤';
+    if (/email not confirmed/i.test(m)) return '這個 Email 還沒完成確認，請先到信箱點確認信裡的連結';
+    if (/already (been )?registered/i.test(m)) return '這個 Email 已經註冊過了，請直接登入';
+    if (/rate limit|too many|over_email_send/i.test(m)) return '嘗試或寄信次數太多，請過一段時間再試';
+    if (/password should be at least/i.test(m)) return '密碼至少要 6 個字元';
+    if (/email.*invalid|invalid.*email/i.test(m)) return 'Email 格式不正確，或這個 Email 網域不被接受';
+    if (/failed to fetch|network/i.test(m)) return '連不上網路，請檢查網路後再試';
+    return '發生問題，請稍後再試';
+  };
+
+  const submitAuth = async () => {
+    if (au.busy || !sb) return;
+    const d = au.draft;
+    const email = d.email.trim().toLowerCase();
+    const name = d.name.trim();
+    au.err = ''; au.info = '';
+    if (au.mode === 'register' && !name) { au.err = '請填寫姓名'; renderAuth(); return; }
+    if (!EMAIL_RE.test(email)) { au.err = 'Email 格式不正確'; renderAuth(); return; }
+    if (d.pw.length < 6) { au.err = '密碼至少要 6 個字元'; renderAuth(); return; }
+
+    au.busy = true; renderAuth();
+    try {
+      if (au.mode === 'register') {
+        const { data, error } = await sb.auth.signUp({ email, password: d.pw, options: { data: { name } } });
+        if (error) throw error;
+        if (!data.session) {
+          // 專案要求 Email 確認：要先到信箱點連結
+          au.info = data.user && data.user.identities && data.user.identities.length === 0
+            ? '這個 Email 已經註冊過了，請直接登入。'
+            : `已寄出確認信到 ${email}。請到信箱點確認連結，完成後回來登入。（沒收到請看垃圾郵件匣）`;
+          au.mode = 'login'; d.pw = ''; au.busy = false; renderAuth();
+          return;
+        }
+      } else {
+        const { error } = await sb.auth.signInWithPassword({ email, password: d.pw });
+        if (error) throw error;
+      }
+      // 記錄這次登入（失敗也不影響使用）
+      try { await sb.rpc('record_login', { p_ua: navigator.userAgent }); } catch (_) { /* ignore */ }
+      au.draft = { name: '', email: '', pw: '' };
+      au.busy = false;
+      authDlg.close();
+    } catch (e) {
+      au.err = authErrText(e); d.pw = ''; au.busy = false; renderAuth();
+    }
+  };
+
+  const renderAuth = () => {
+    const d = au.draft;
+    const reg = au.mode === 'register';
+    authDlg.replaceChildren(h('div', { class: 'pk' },
+      h('div', { class: 'pk-head' },
+        h('h2', { id: 'authTitle' }, reg ? '👤 註冊帳號' : '👤 會員登入'),
+        h('button', { class: 'btn', type: 'button', onclick: () => authDlg.close() }, '✔ 關閉')),
+      h('div', { class: 'pk-body' },
+        h('div', { class: 'seg', role: 'group', 'aria-label': '登入或註冊', style: 'margin-bottom:10px' },
+          h('button', { type: 'button', 'aria-pressed': String(!reg), onclick: () => { au.mode = 'login'; au.err = ''; au.info = ''; renderAuth(); } }, '我已有帳號'),
+          h('button', { type: 'button', 'aria-pressed': String(reg), onclick: () => { au.mode = 'register'; au.err = ''; au.info = ''; renderAuth(); } }, '第一次使用')),
+        h('p', { class: 'hint', style: 'margin-top:0' }, '登入後，三餐、健康數值、用藥與看診都會存到雲端；每個人只看得到自己的資料。'),
+        au.info && h('p', { class: 'okmsg', role: 'status' }, au.info),
+        h('form', { class: 'form', onsubmit: e => { e.preventDefault(); submitAuth(); } },
+          h('div', { class: 'form-grid' },
+            reg && field('姓名', h('input', { type: 'text', name: 'name', required: true, maxlength: 40, autocomplete: 'name', value: d.name, oninput: bindDraft(d, 'name') }), 'wide'),
+            field('Email', h('input', { type: 'email', name: 'email', required: true, maxlength: 80, autocomplete: 'email', value: d.email, placeholder: 'name@example.com', oninput: bindDraft(d, 'email') }), 'wide'),
+            field(reg ? '設定密碼（至少 6 個字元）' : '密碼', h('input', { type: 'password', name: 'pw', required: true, minlength: 6, autocomplete: reg ? 'new-password' : 'current-password', value: d.pw, oninput: bindDraft(d, 'pw') }), 'wide')),
+          au.err && h('p', { class: 'err', role: 'alert' }, `⚠️ ${au.err}`),
+          h('div', { class: 'row' }, h('button', { class: 'btn primary block', type: 'submit', disabled: au.busy },
+            au.busy ? '處理中…' : (reg ? '建立帳號' : '登入')))))));
+  };
+
+  const openAuth = (mode = 'login', name = '') => {
+    if (!sb) { toast('雲端功能暫時無法使用'); return; }
+    au.mode = mode; au.err = ''; au.info = '';
+    if (name) au.draft.name = name;
+    renderAuth();
+    authDlg.showModal();
+  };
+  authDlg.addEventListener('click', e => { if (e.target === authDlg) authDlg.close(); });
+
   /* ---------- 邀請家人朋友 ---------- */
 
   const inviteDlg = $('#invite');
@@ -1038,7 +1410,7 @@
   // 帳密不放在網頁裡：由資料庫函式驗證（密碼只存雜湊），連續失敗 5 次會鎖定 10 分鐘。
 
   const adminDlg = $('#admin');
-  const adm = { draft: { u: '', p: '' }, creds: null, items: null, err: '', busy: false };
+  const adm = { draft: { u: '', p: '' }, creds: null, items: null, members: null, tab: 'invites', err: '', busy: false };
   const fmtTime = iso => {
     const d = new Date(iso);
     return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -1048,8 +1420,11 @@
     adm.busy = true; adm.err = ''; renderAdmin();
     try {
       const r = await rpc('admin_list_invitations', { p_username: u, p_password: p });
-      if (r.ok) { adm.creds = { u, p }; adm.items = r.items; adm.draft = { u: '', p: '' }; }
-      else {
+      if (r.ok) {
+        const m = await rpc('admin_list_members', { p_username: u, p_password: p });
+        adm.creds = { u, p }; adm.items = r.items; adm.members = m.ok ? m : { members: [], logins: [] };
+        adm.draft = { u: '', p: '' };
+      } else {
         adm.draft.p = '';
         adm.err = r.error === 'locked' ? '登入錯誤次數過多，請 10 分鐘後再試' : '帳號或密碼錯誤';
       }
@@ -1074,15 +1449,12 @@
         h('div', { class: 'row' }, h('button', { class: 'btn primary block', type: 'submit', disabled: adm.busy }, adm.busy ? '登入中…' : '登入')));
     } else {
       const accepted = items.filter(x => x.accepted_at).length;
-      body = h('div', {},
+      const mem = adm.members;
+      const invitesView = () => [
         h('div', { class: 'week-stats' },
           h('div', { class: 'stat' }, h('b', {}, items.length), h('span', {}, '受邀人數')),
           h('div', { class: 'stat' }, h('b', {}, accepted), h('span', {}, '已接受')),
           h('div', { class: 'stat' }, h('b', {}, items.length - accepted), h('span', {}, '尚未接受'))),
-        adm.err && h('p', { class: 'err', role: 'alert' }, `⚠️ ${adm.err}`),
-        h('div', { class: 'row' },
-          h('button', { class: 'btn', type: 'button', disabled: adm.busy, onclick: () => adminLogin(adm.creds.u, adm.creds.p) }, adm.busy ? '更新中…' : '🔄 重新整理'),
-          h('button', { class: 'btn', type: 'button', onclick: () => { adm.creds = null; adm.items = null; renderAdmin(); } }, '登出')),
         items.length
           ? h('div', { class: 'list', style: 'margin-top:12px' }, items.map(x => h('article', { class: 'item' },
             h('div', { class: 'item-top' },
@@ -1091,7 +1463,36 @@
             h('p', { class: 'em' }, x.email),
             x.note && h('p', { class: 'hint' }, `📌 ${x.note}`),
             h('p', { class: 'hint' }, `邀請時間：${fmtTime(x.invited_at)}`))))
-          : h('p', { class: 'empty', style: 'margin-top:12px' }, '目前還沒有人被邀請。'));
+          : h('p', { class: 'empty', style: 'margin-top:12px' }, '目前還沒有人被邀請。'),
+      ];
+      const membersView = () => [
+        h('div', { class: 'week-stats' },
+          h('div', { class: 'stat' }, h('b', {}, mem.members.length), h('span', {}, '註冊會員')),
+          h('div', { class: 'stat' }, h('b', {}, mem.members.filter(x => x.login_count > 0).length), h('span', {}, '登入過')),
+          h('div', { class: 'stat' }, h('b', {}, mem.members.filter(x => x.days_logged > 0).length), h('span', {}, '有記錄健康')),),
+        h('p', { class: 'hint' }, '為保護隱私，這裡只顯示登入與記錄的「次數」，看不到會員的健康內容。'),
+        mem.members.length
+          ? h('div', { class: 'list' }, mem.members.map(x => h('article', { class: 'item' },
+            h('div', { class: 'item-top' }, h('b', {}, x.name || '（未填姓名）'), h('span', { class: 'state ok' }, `登入 ${x.login_count} 次`)),
+            h('p', { class: 'em' }, x.email),
+            h('p', { class: 'hint' }, `註冊：${fmtTime(x.created_at)}　最後登入：${x.last_login ? fmtTime(x.last_login) : '尚未登入'}`),
+            h('p', { class: 'hint' }, `已記錄健康 ${x.days_logged} 天${x.last_log_date ? `（最近：${x.last_log_date}）` : ''}`))))
+          : h('p', { class: 'empty' }, '目前還沒有人註冊。'),
+        mem.logins.length > 0 && h('div', { class: 'invite-list' },
+          h('h3', {}, `🕒 最近登入紀錄（${mem.logins.length}）`),
+          mem.logins.map(l => h('div', { class: 'login-row' },
+            h('span', {}, h('b', {}, l.name || l.email), h('small', {}, `　${l.email}`)),
+            h('span', { class: 'when' }, fmtTime(l.at))))),
+      ];
+      body = h('div', {},
+        h('div', { class: 'seg', role: 'group', 'aria-label': '管理員頁面', style: 'margin-bottom:12px' },
+          h('button', { type: 'button', 'aria-pressed': String(adm.tab === 'invites'), onclick: () => { adm.tab = 'invites'; renderAdmin(); } }, '✉️ 受邀名單'),
+          h('button', { type: 'button', 'aria-pressed': String(adm.tab === 'members'), onclick: () => { adm.tab = 'members'; renderAdmin(); } }, '👥 會員與登入')),
+        adm.tab === 'invites' ? invitesView() : membersView(),
+        adm.err && h('p', { class: 'err', role: 'alert' }, `⚠️ ${adm.err}`),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn', type: 'button', disabled: adm.busy, onclick: () => adminLogin(adm.creds.u, adm.creds.p) }, adm.busy ? '更新中…' : '🔄 重新整理'),
+          h('button', { class: 'btn', type: 'button', onclick: () => { adm.creds = null; adm.items = null; adm.members = null; renderAdmin(); } }, '登出')));
     }
 
     adminDlg.replaceChildren(h('div', { class: 'pk' },
@@ -1104,7 +1505,7 @@
   $('#btnAdmin').addEventListener('click', () => { adm.err = ''; renderAdmin(); adminDlg.showModal(); });
   adminDlg.addEventListener('click', e => { if (e.target === adminDlg) adminDlg.close(); });
   // 關閉視窗就登出，並清掉記憶體中的帳密
-  adminDlg.addEventListener('close', () => { adm.creds = null; adm.items = null; adm.draft = { u: '', p: '' }; adm.err = ''; });
+  adminDlg.addEventListener('close', () => { adm.creds = null; adm.items = null; adm.members = null; adm.tab = 'invites'; adm.draft = { u: '', p: '' }; adm.err = ''; });
 
   /* ---------- 受邀者從信件連結進來 ---------- */
 
@@ -1188,6 +1589,7 @@
 
   applySize();
   render();
+  renderAcct();
   checkReminders();
   setInterval(checkReminders, 30000);
   handleInviteLink();

@@ -17,6 +17,7 @@
         <button id="fontUp" type="button" aria-label="字體放大">A＋</button>
       </div>
     </div>
+    <div id="acctbar" class="acctbar" aria-live="polite"></div>
   </header>
   <div class="tabbar">
     <nav class="tabs" role="tablist" aria-label="頁面選單">
@@ -46,8 +47,11 @@
   <dialog id="picker" class="sheet" aria-labelledby="pickerTitle"></dialog>
   <dialog id="invite" class="sheet" aria-labelledby="inviteTitle"></dialog>
   <dialog id="admin" class="sheet" aria-labelledby="adminTitle"></dialog>
+  <dialog id="auth" class="sheet" aria-labelledby="authTitle"></dialog>
   <div id="toast" role="status" aria-live="polite"></div>
 
+  <!-- Supabase 用戶端：處理會員登入與雲端資料；若載入失敗，網站仍可在本機使用 -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="app.js"></script>
 </body>
 </html>
