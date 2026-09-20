@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>銀髮三餐養身日記</title>
+  <meta name="description" content="專為長輩設計的三餐飲食紀錄：點選食物、記錄喝水與精神狀況，一眼看出今天吃得夠不夠均衡。">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <h1>🍚 銀髮三餐養身日記</h1>
+      <div class="size-ctl" role="group" aria-label="調整字體大小">
+        <button id="fontDown" type="button" aria-label="字體縮小">A−</button>
+        <button id="fontUp" type="button" aria-label="字體放大">A＋</button>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="頁面選單">
+      <button role="tab" data-tab="today" type="button"><span class="ti" aria-hidden="true">📝</span><span>今天</span></button>
+      <button role="tab" data-tab="week" type="button"><span class="ti" aria-hidden="true">📅</span><span>近七天</span></button>
+      <button role="tab" data-tab="care" type="button"><span class="ti" aria-hidden="true">💊</span><span>看診用藥</span></button>
+      <button role="tab" data-tab="tips" type="button"><span class="ti" aria-hidden="true">💡</span><span>小叮嚀</span></button>
+    </nav>
+  </header>
+
+  <div id="alerts" class="alerts" aria-live="assertive"></div>
+
+  <main id="app" tabindex="-1"></main>
+
+  <footer class="foot">
+    <p>資料自動儲存在這台電腦／手機的瀏覽器中，不會上傳到網路。</p>
+    <div class="foot-btns">
+      <button type="button" id="btnPrint">🖨️ 列印</button>
+      <button type="button" id="btnExport">💾 備份資料</button>
+      <button type="button" id="btnImport">📂 還原備份</button>
+      <input type="file" id="fileImport" accept="application/json" hidden>
+    </div>
+    <p class="small">本網站僅供飲食記錄與一般衛教參考，不能取代醫師或營養師的建議。</p>
+  </footer>
+
+  <dialog id="picker" aria-labelledby="pickerTitle"></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
