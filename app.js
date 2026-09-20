@@ -118,6 +118,23 @@
     toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
   };
 
+  /* ---------- Supabase（專案 0920_Health）---------- */
+  // 這裡的金鑰是「公開金鑰」，本來就會出現在網頁裡。資料表已鎖住（RLS），
+  // 網頁只能呼叫三個資料庫函式：建立邀請、接受邀請、管理員查詢（需帳密）。
+
+  const SUPABASE_URL = 'https://bcmmdygvypgodxqcfqnn.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_VhbU0b9WqgH1yv0kAIei3g_AgT255Zx';
+
+  const rpc = async (fn, args) => {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+      method: 'POST',
+      headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    if (!res.ok) throw new Error(`${fn} failed: ${res.status}`);
+    return res.json();
+  };
+
   /* ---------- 資料存取 ---------- */
 
   const STORE = 'silver-diet-v1';
@@ -153,6 +170,15 @@
   const validDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
   const validTime = s => typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
   const str = (v, n) => (typeof v === 'string' ? v.trim().slice(0, n) : '');
+  const EMAIL_RE = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
+
+  const normalizeInvite = i => {
+    if (!i || !str(i.name, 40) || !EMAIL_RE.test(str(i.email, 80))) return null;
+    return {
+      id: str(i.id, 30) || uid(), name: str(i.name, 40), email: str(i.email, 80),
+      note: str(i.note, 200), date: validDate(i.date) ? i.date : todayStr(),
+    };
+  };
 
   const normalizeMed = m => {
     if (!m || !str(m.name, 40)) return null;
@@ -190,6 +216,8 @@
       meds: (Array.isArray(raw.meds) ? raw.meds : []).map(normalizeMed).filter(Boolean),
       appts: (Array.isArray(raw.appts) ? raw.appts : []).map(normalizeAppt).filter(Boolean),
       notify: !!raw.notify,
+      invites: (Array.isArray(raw.invites) ? raw.invites : []).map(normalizeInvite).filter(Boolean),
+      siteUrl: typeof raw.siteUrl === 'string' && /^https?:\/\/\S+$/.test(raw.siteUrl.trim()) ? raw.siteUrl.trim().slice(0, 300) : '',
     };
   };
 
@@ -207,6 +235,7 @@
   const state = {
     date: todayStr(), tab: 'today', pickerMeal: null, pickerCat: 'grain',
     apptDraft: newAppt(), medDraft: newMed(),
+    welcome: null, // 受邀者從信件連結進來時顯示的歡迎訊息
   };
 
   const save = () => {
@@ -440,8 +469,14 @@
       ...MEALS.map(m => mealCard(m, day)),
       waterCard(day),
       feelCard(day),
+      inviteCard(),
     ];
   };
+
+  const inviteCard = () => h('section', { class: 'card', 'aria-labelledby': 'inv-h' },
+    h('h2', { id: 'inv-h' }, '👨‍👩‍👧 邀請家人朋友一起用'),
+    h('p', {}, '每個人都有自己的日記簿，資料只存在自己的手機或電腦裡，各自管理、互不干擾。'),
+    h('button', { class: 'btn primary block', type: 'button', onclick: () => openInvite() }, '✉️ 邀請一位新朋友'));
 
   /* ---------- 畫面：近七天 ---------- */
 
@@ -653,6 +688,15 @@
   const renderAlerts = () => {
     const today = todayStr(), hm = nowHM();
     const items = [];
+    if (state.welcome) {
+      const w = state.welcome;
+      const msg = w.kind === 'ok' ? `🎉 ${w.name}，歡迎加入「銀髮健康日記簿」！您已接受邀請。您的日記只存在這台裝置裡，別人看不到。`
+        : w.kind === 'bad' ? '這個邀請連結無效或已過期，但您仍可以直接使用本網站。'
+          : '目前無法確認邀請（網路連線問題），網站仍可正常使用。';
+      items.push(h('div', { class: 'alert welcome', role: 'status' },
+        h('span', {}, msg),
+        h('button', { class: 'btn primary', type: 'button', onclick: () => { state.welcome = null; renderAlerts(); } }, '開始使用')));
+    }
     const due = dosesFor(today).filter(d => d.time <= hm && !takenAt(today, d.key));
     due.slice(0, 3).forEach(d => items.push(h('div', { class: 'alert med', role: 'alert' },
       h('span', {}, `💊 該吃藥了：${d.med.name}${d.med.dose ? ' ' + d.med.dose : ''}（${d.time}）`),
@@ -831,6 +875,258 @@
     ];
   };
 
+  /* ---------- 邀請家人朋友 ---------- */
+
+  const inviteDlg = $('#invite');
+  const inv = { draft: { name: '', email: '', note: '' }, sent: null, msg: '', err: '', busy: false };
+
+  const isLocalHost = () => location.protocol === 'file:'
+    || /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1)/.test(location.hostname);
+  const siteUrl = () => db.siteUrl || (location.protocol === 'file:' ? location.href : location.origin + location.pathname);
+
+  // 每位受邀者有自己的接受連結：網站網址 + ?invite=專屬代碼
+  const acceptUrl = token => {
+    try { const u = new URL(siteUrl()); u.searchParams.set('invite', token); return u.toString(); }
+    catch (_) { return `${siteUrl()}?invite=${encodeURIComponent(token)}`; }
+  };
+
+  const buildInvite = (i, token) => {
+    const text = [
+      `${i.name} 您好：`, '',
+      '邀請您一起使用「銀髮健康日記簿」，可以記錄每天的三餐、喝水、用藥時間與看診提醒。', '',
+      '✅ 請點下面這個連結「接受邀請」，就會開啟網站：',
+      `👉 ${acceptUrl(token)}`,
+      ...(i.note ? ['', `💬 留言：${i.note}`] : []),
+      '',
+      '使用方式：用手機或電腦打開上面的連結就能開始。每個人的日記都只存在自己的裝置裡，只有自己看得到，不會互相影響。',
+    ].join('\n');
+    const subject = `${i.name}，邀請您一起使用「銀髮健康日記簿」`;
+    const mailto = `mailto:${encodeURIComponent(i.email).replace(/%40/g, '@')}`
+      + `?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text.replace(/\n/g, '\r\n'))}`;
+    const line = `https://line.me/R/msg/text/?${encodeURIComponent(text)}`;
+    return { text, subject, mailto, line };
+  };
+
+  const openMail = href => { const a = h('a', { href }); document.body.append(a); a.click(); a.remove(); };
+
+  const copyText = async text => {
+    try { await navigator.clipboard.writeText(text); return true; } catch (_) { /* 改用備援方式 */ }
+    try {
+      const ta = h('textarea', { style: 'position:fixed;opacity:0' }, text);
+      document.body.append(ta); ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (_) { return false; }
+  };
+
+  // 對話框蓋在最上層，一般的吐司訊息會被擋住，所以訊息顯示在對話框內
+  let invMsgTimer;
+  const flash = msg => {
+    inv.msg = msg; renderInvite();
+    clearTimeout(invMsgTimer);
+    invMsgTimer = setTimeout(() => { inv.msg = ''; if (inviteDlg.open) renderInvite(); }, 2500);
+  };
+
+  const submitInvite = () => {
+    const d = inv.draft;
+    const name = d.name.trim(), email = d.email.trim(), note = d.note.trim();
+    if (!name) { inv.err = '請填寫姓名'; renderInvite(); return; }
+    if (!EMAIL_RE.test(email)) { inv.err = 'Email 格式不正確，請再確認'; renderInvite(); return; }
+    requestInvite({ name, email, note });
+  };
+
+  // 先把邀請記錄到資料庫（取得專屬接受代碼），成功後才產生邀請信
+  const requestInvite = async ({ name, email, note }) => {
+    if (inv.busy) return;
+    inv.busy = true; inv.err = ''; renderInvite();
+    let token;
+    try {
+      token = await rpc('create_invitation', { p_name: name, p_email: email, p_note: note });
+    } catch (_) {
+      inv.busy = false;
+      inv.err = '無法連線到資料庫，這次邀請沒有送出。請檢查網路後再試一次。';
+      renderInvite();
+      return;
+    }
+    inv.busy = false;
+
+    const rec = normalizeInvite({ id: uid(), name, email, note, date: todayStr() });
+    const i = db.invites.findIndex(x => x.email.toLowerCase() === email.toLowerCase());
+    if (i >= 0) db.invites[i] = { ...rec, id: db.invites[i].id }; else db.invites.unshift(rec);
+    save();
+    inv.draft = { name: '', email: '', note: '' };
+
+    const built = buildInvite(rec, token);
+    inv.sent = { ...rec, ...built };
+    renderInvite();
+    openMail(built.mailto);
+  };
+
+  const renderInvite = () => {
+    const d = inv.draft;
+    const url = siteUrl();
+    const local = !db.siteUrl && isLocalHost();
+    const s = inv.sent;
+    let urlInput;
+
+    inviteDlg.replaceChildren(h('div', { class: 'pk' },
+      h('div', { class: 'pk-head' },
+        h('h2', { id: 'inviteTitle' }, '✉️ 邀請家人朋友'),
+        h('button', { class: 'btn', type: 'button', onclick: () => inviteDlg.close() }, '✔ 關閉')),
+      h('div', { class: 'pk-body' },
+        h('p', { class: 'hint', style: 'margin-top:0' }, '邀請對方一起使用。每個人的日記簿都存在自己的手機或電腦裡，各自管理、互相看不到。'),
+        inv.msg && h('p', { class: 'okmsg', role: 'status' }, inv.msg),
+
+        h('div', { class: 'linkbox' },
+          h('b', {}, '🔗 網站連結'),
+          h('a', { class: 'url', href: url, target: '_blank', rel: 'noopener' }, url),
+          h('div', { class: 'row', style: 'margin-top:6px' },
+            h('button', { class: 'btn', type: 'button', onclick: async () => flash(await copyText(url) ? '✓ 已複製網站連結' : '複製失敗，請長按連結自行複製') }, '📋 複製連結')),
+          local && h('p', { class: 'warn' }, '⚠️ 目前是在這台電腦上開啟，對方點這個連結會打不開。等網站放上網路後，請在下方改成正式網址。'),
+          h('details', { open: local },
+            h('summary', {}, '更改網站連結'),
+            h('div', { class: 'urledit' },
+              urlInput = h('input', { type: 'url', placeholder: 'https://你的網站網址', value: db.siteUrl, 'aria-label': '網站正式網址' }),
+              h('button', { class: 'btn primary', type: 'button', onclick: () => {
+                const v = urlInput.value.trim();
+                if (v && !/^https?:\/\/\S+$/.test(v)) { inv.err = '網址請以 http:// 或 https:// 開頭'; renderInvite(); return; }
+                inv.err = ''; db.siteUrl = v; save();
+                flash(v ? '✓ 已儲存網站連結' : '已恢復為目前網址');
+              } }, '儲存')))),
+
+        inv.err && h('p', { class: 'err', role: 'alert' }, `⚠️ ${inv.err}`),
+
+        s
+          ? h('div', { class: 'sent' },
+            h('h3', {}, `✅ 已為 ${s.name} 準備好邀請信`),
+            h('p', { class: 'hint' }, `收件人：${s.email}。邀請已記錄。本網站無法自動代寄，請在跳出的郵件程式按「傳送」；沒有跳出的話，可用下面的方式。對方點信中的「接受邀請」連結，就會開啟網站並完成接受。`),
+            h('textarea', { readonly: true, 'aria-label': '邀請內容', rows: 8 }, s.text),
+            h('div', { class: 'row' },
+              h('a', { class: 'btn primary', href: s.mailto }, '✉️ 開啟郵件程式'),
+              h('button', { class: 'btn', type: 'button', onclick: async () => flash(await copyText(s.text) ? '✓ 已複製邀請內容，可貼到 LINE 或簡訊' : '複製失敗，請長按文字自行複製') }, '📋 複製邀請內容'),
+              h('a', { class: 'btn', href: s.line, target: '_blank', rel: 'noopener' }, '💬 用 LINE 傳送'),
+              h('button', { class: 'btn', type: 'button', onclick: () => { inv.sent = null; renderInvite(); } }, '＋ 再邀請一位')))
+          : h('form', { class: 'form', onsubmit: e => { e.preventDefault(); submitInvite(); } },
+            h('div', { class: 'form-grid' },
+              field('姓名', h('input', { type: 'text', name: 'name', required: true, maxlength: 40, autocomplete: 'off', value: d.name, placeholder: '例如：王小明', oninput: bindDraft(d, 'name') }), 'wide'),
+              field('Email', h('input', { type: 'email', name: 'email', required: true, maxlength: 80, autocomplete: 'off', value: d.email, placeholder: 'name@example.com', oninput: bindDraft(d, 'email') }), 'wide'),
+              field('備註（會附在邀請信中）', h('textarea', { name: 'note', maxlength: 200, rows: 3, placeholder: '例如：媽媽，這是幫你記三餐和吃藥的網站', oninput: bindDraft(d, 'note') }, d.note), 'wide')),
+            h('div', { class: 'row' }, h('button', { class: 'btn primary block', type: 'submit', disabled: inv.busy }, inv.busy ? '送出中…' : '送出邀請'))),
+
+        db.invites.length > 0 && h('div', { class: 'invite-list' },
+          h('h3', {}, `📒 邀請紀錄（${db.invites.length}）`),
+          db.invites.map(i => h('div', { class: 'invite-row' },
+            h('span', { class: 'who' }, h('b', {}, i.name), h('small', {}, `${i.email}　${i.date}`)),
+            h('button', { class: 'btn', type: 'button', disabled: inv.busy, onclick: () => requestInvite(i) }, '再寄一次'),
+            h('button', { class: 'btn danger', type: 'button', 'aria-label': `刪除 ${i.name} 的邀請紀錄`, onclick: () => {
+              if (!confirm(`確定要刪除「${i.name}」的邀請紀錄嗎？`)) return;
+              db.invites = db.invites.filter(x => x.id !== i.id); save(); renderInvite();
+            } }, '刪除')))))));
+  };
+
+  const openInvite = () => {
+    inv.sent = null; inv.msg = ''; inv.err = '';
+    renderInvite();
+    inviteDlg.showModal();
+  };
+
+  inviteDlg.addEventListener('click', e => { if (e.target === inviteDlg) inviteDlg.close(); });
+  $('#btnInvite').addEventListener('click', openInvite);
+
+  /* ---------- 管理員：登入與查看受邀名單 ---------- */
+  // 帳密不放在網頁裡：由資料庫函式驗證（密碼只存雜湊），連續失敗 5 次會鎖定 10 分鐘。
+
+  const adminDlg = $('#admin');
+  const adm = { draft: { u: '', p: '' }, creds: null, items: null, err: '', busy: false };
+  const fmtTime = iso => {
+    const d = new Date(iso);
+    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  const adminLogin = async (u, p) => {
+    adm.busy = true; adm.err = ''; renderAdmin();
+    try {
+      const r = await rpc('admin_list_invitations', { p_username: u, p_password: p });
+      if (r.ok) { adm.creds = { u, p }; adm.items = r.items; adm.draft = { u: '', p: '' }; }
+      else {
+        adm.draft.p = '';
+        adm.err = r.error === 'locked' ? '登入錯誤次數過多，請 10 分鐘後再試' : '帳號或密碼錯誤';
+      }
+    } catch (_) {
+      adm.err = '無法連線到資料庫，請檢查網路後再試';
+    }
+    adm.busy = false;
+    renderAdmin();
+  };
+
+  const renderAdmin = () => {
+    const d = adm.draft;
+    const items = adm.items;
+    let body;
+
+    if (!items) {
+      body = h('form', { class: 'form', onsubmit: e => { e.preventDefault(); adminLogin(d.u.trim(), d.p); } },
+        h('div', { class: 'form-grid' },
+          field('管理員帳號', h('input', { type: 'text', name: 'u', required: true, autocomplete: 'username', autocapitalize: 'off', value: d.u, oninput: bindDraft(d, 'u') }), 'wide'),
+          field('密碼', h('input', { type: 'password', name: 'p', required: true, autocomplete: 'current-password', value: d.p, oninput: bindDraft(d, 'p') }), 'wide')),
+        adm.err && h('p', { class: 'err', role: 'alert' }, `⚠️ ${adm.err}`),
+        h('div', { class: 'row' }, h('button', { class: 'btn primary block', type: 'submit', disabled: adm.busy }, adm.busy ? '登入中…' : '登入')));
+    } else {
+      const accepted = items.filter(x => x.accepted_at).length;
+      body = h('div', {},
+        h('div', { class: 'week-stats' },
+          h('div', { class: 'stat' }, h('b', {}, items.length), h('span', {}, '受邀人數')),
+          h('div', { class: 'stat' }, h('b', {}, accepted), h('span', {}, '已接受')),
+          h('div', { class: 'stat' }, h('b', {}, items.length - accepted), h('span', {}, '尚未接受'))),
+        adm.err && h('p', { class: 'err', role: 'alert' }, `⚠️ ${adm.err}`),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn', type: 'button', disabled: adm.busy, onclick: () => adminLogin(adm.creds.u, adm.creds.p) }, adm.busy ? '更新中…' : '🔄 重新整理'),
+          h('button', { class: 'btn', type: 'button', onclick: () => { adm.creds = null; adm.items = null; renderAdmin(); } }, '登出')),
+        items.length
+          ? h('div', { class: 'list', style: 'margin-top:12px' }, items.map(x => h('article', { class: 'item' },
+            h('div', { class: 'item-top' },
+              h('b', {}, x.name),
+              h('span', { class: `state ${x.accepted_at ? 'ok' : 'wait'}` }, x.accepted_at ? `✅ 已接受 ${fmtTime(x.accepted_at)}` : '⏳ 尚未接受')),
+            h('p', { class: 'em' }, x.email),
+            x.note && h('p', { class: 'hint' }, `📌 ${x.note}`),
+            h('p', { class: 'hint' }, `邀請時間：${fmtTime(x.invited_at)}`))))
+          : h('p', { class: 'empty', style: 'margin-top:12px' }, '目前還沒有人被邀請。'));
+    }
+
+    adminDlg.replaceChildren(h('div', { class: 'pk' },
+      h('div', { class: 'pk-head' },
+        h('h2', { id: 'adminTitle' }, items ? '👤 管理員：受邀名單' : '👤 管理員登入'),
+        h('button', { class: 'btn', type: 'button', onclick: () => adminDlg.close() }, '✔ 關閉')),
+      h('div', { class: 'pk-body' }, body)));
+  };
+
+  $('#btnAdmin').addEventListener('click', () => { adm.err = ''; renderAdmin(); adminDlg.showModal(); });
+  adminDlg.addEventListener('click', e => { if (e.target === adminDlg) adminDlg.close(); });
+  // 關閉視窗就登出，並清掉記憶體中的帳密
+  adminDlg.addEventListener('close', () => { adm.creds = null; adm.items = null; adm.draft = { u: '', p: '' }; adm.err = ''; });
+
+  /* ---------- 受邀者從信件連結進來 ---------- */
+
+  const handleInviteLink = async () => {
+    let token;
+    try {
+      const url = new URL(location.href);
+      token = url.searchParams.get('invite');
+      if (!token) return;
+      url.searchParams.delete('invite');
+      history.replaceState(null, '', url.pathname + url.search + url.hash); // 網址列不留代碼
+    } catch (_) { /* file:// 等環境可能無法改網址，忽略 */ }
+    if (!token) return;
+    try {
+      const name = await rpc('accept_invitation', { p_token: token });
+      state.welcome = name ? { kind: 'ok', name } : { kind: 'bad' };
+    } catch (_) {
+      state.welcome = { kind: 'offline' };
+    }
+    renderAlerts();
+  };
+
   /* ---------- 主畫面 ---------- */
 
   const app = $('#app');
@@ -894,4 +1190,5 @@
   render();
   checkReminders();
   setInterval(checkReminders, 30000);
+  handleInviteLink();
 })();
